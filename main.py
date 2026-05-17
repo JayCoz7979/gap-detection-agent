@@ -1,18 +1,20 @@
 """
 Gap Detection Agent — Cosby AI Solutions
-Weekly scan of all 8 Cosby AI projects for gaps, security issues, and missing integrations.
-Schedule: Every Sunday at 9 PM Eastern (UTC-5 standard / UTC-4 daylight).
+Weekly scan + auto-heal + Telegram command interface.
+Schedule: Every Sunday at 9 PM Eastern.
 """
 import os
 import logging
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from scanner import run_scan
+from telegram_commands import handle_update
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,13 +23,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 INTERNAL_KEY = os.environ.get("INTERNAL_KEY", "")
-
 scheduler = AsyncIOScheduler(timezone="US/Eastern")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Sunday 9 PM Eastern
     scheduler.add_job(
         _run_scan_job,
         CronTrigger(day_of_week=6, hour=21, minute=0, timezone="US/Eastern"),
@@ -38,8 +38,13 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     logger.info("Gap detection scheduler started — fires Sunday 21:00 Eastern")
 
-    from telegram_client import send
-    send("🔍 Gap Detection Agent online — Sunday 9 PM Eastern scans active")
+    # Register Telegram webhook
+    from telegram_client import register_webhook, send
+    public_url = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+    if public_url:
+        register_webhook(f"https://{public_url}/telegram/webhook")
+
+    send("🔍 Gap Detection Agent online — auto-heal + Telegram commands active")
 
     yield
     scheduler.shutdown()
@@ -55,37 +60,51 @@ async def _run_scan_job():
 
 app = FastAPI(
     title="Gap Detection Agent",
-    description="Weekly Cosby AI project gap scanner",
-    version="1.0.0",
+    description="Weekly Cosby AI gap scanner with auto-heal and rollback",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
 
+# ── Health ────────────────────────────────────────────────────────────────────
+
 @app.get("/health")
 def health():
-    next_run = None
     job = scheduler.get_job("weekly_gap_scan")
-    if job and job.next_run_time:
-        next_run = job.next_run_time.isoformat()
-
     return {
         "status": "ok",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "service": "gap-detection-agent",
-        "next_scan": next_run,
+        "version": "2.0.0",
+        "next_scan": job.next_run_time.isoformat() if job and job.next_run_time else None,
     }
 
 
+# ── Telegram webhook ──────────────────────────────────────────────────────────
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    """Receive Telegram Update objects and dispatch commands."""
+    try:
+        update = await request.json()
+        threading.Thread(target=handle_update, args=(update,), daemon=True).start()
+    except Exception as e:
+        logger.error("Webhook parse error: %s", e)
+    return {"ok": True}
+
+
+# ── Manual scan trigger ───────────────────────────────────────────────────────
+
 @app.post("/scan/trigger")
 def trigger_scan(x_internal_key: str = Header(default="")):
-    """Manual trigger for testing. Requires INTERNAL_KEY header."""
+    """Manual scan trigger for testing. Requires X-Internal-Key header."""
     if INTERNAL_KEY and x_internal_key != INTERNAL_KEY:
         raise HTTPException(status_code=403, detail="Invalid internal key")
-
-    import threading
     threading.Thread(target=run_scan, daemon=True).start()
     return {"status": "scan started", "timestamp": datetime.now(timezone.utc).isoformat()}
 
+
+# ── Gap queries ───────────────────────────────────────────────────────────────
 
 @app.get("/gaps")
 def list_gaps(
@@ -94,7 +113,6 @@ def list_gaps(
     severity: str | None = None,
     x_internal_key: str = Header(default=""),
 ):
-    """Query stored gaps. Requires INTERNAL_KEY header."""
     if INTERNAL_KEY and x_internal_key != INTERNAL_KEY:
         raise HTTPException(status_code=403, detail="Invalid internal key")
 
@@ -121,7 +139,6 @@ def update_gap_status(
     body: dict,
     x_internal_key: str = Header(default=""),
 ):
-    """Update a gap's status or notes. Requires INTERNAL_KEY header."""
     if INTERNAL_KEY and x_internal_key != INTERNAL_KEY:
         raise HTTPException(status_code=403, detail="Invalid internal key")
 
@@ -134,3 +151,26 @@ def update_gap_status(
     client = get_client()
     result = client.table("gap_detections").update(update).eq("id", gap_id).execute()
     return {"updated": result.data}
+
+
+# ── Fix queries ───────────────────────────────────────────────────────────────
+
+@app.get("/fixes")
+def list_fixes(
+    status: str = "success,failed,rolled_back,executing",
+    x_internal_key: str = Header(default=""),
+):
+    if INTERNAL_KEY and x_internal_key != INTERNAL_KEY:
+        raise HTTPException(status_code=403, detail="Invalid internal key")
+
+    from db import get_client
+    client = get_client()
+    result = (
+        client.table("gap_fixes")
+        .select("*")
+        .in_("status", status.split(","))
+        .order("created_at", desc=True)
+        .limit(100)
+        .execute()
+    )
+    return {"fixes": result.data, "count": len(result.data or [])}

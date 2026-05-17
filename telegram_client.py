@@ -1,4 +1,4 @@
-"""Telegram notification sender."""
+"""Telegram notification sender + webhook registration."""
 import os
 import logging
 import httpx
@@ -8,18 +8,20 @@ logger = logging.getLogger(__name__)
 TELEGRAM_API = "https://api.telegram.org"
 
 
+def _token() -> str:
+    return os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
+
 def send(message: str, chat_id: str | None = None) -> bool:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    token = _token()
     if not token:
-        logger.warning("TELEGRAM_BOT_TOKEN not set — skipping Telegram send")
+        logger.warning("TELEGRAM_BOT_TOKEN not set — skipping send")
         return False
 
     target = chat_id or os.environ.get("TELEGRAM_GROUP_ID", "-5271660549")
-
-    # Telegram max message length is 4096 chars; split if needed
-    chunks = [message[i:i+4000] for i in range(0, len(message), 4000)]
-
+    chunks = [message[i:i + 4000] for i in range(0, len(message), 4000)]
     success = True
+
     for chunk in chunks:
         try:
             r = httpx.post(
@@ -37,13 +39,35 @@ def send(message: str, chat_id: str | None = None) -> bool:
     return success
 
 
+def register_webhook(url: str) -> bool:
+    """Tell Telegram to push updates to our /telegram/webhook endpoint."""
+    token = _token()
+    if not token:
+        logger.warning("TELEGRAM_BOT_TOKEN not set — skipping webhook registration")
+        return False
+    try:
+        r = httpx.post(
+            f"{TELEGRAM_API}/bot{token}/setWebhook",
+            json={"url": url, "allowed_updates": ["message", "edited_message"]},
+            timeout=10,
+        )
+        data = r.json()
+        if data.get("ok"):
+            logger.info("Telegram webhook registered: %s", url)
+            return True
+        logger.error("Webhook registration failed: %s", data)
+        return False
+    except Exception as e:
+        logger.error("Webhook registration error: %s", e)
+        return False
+
+
 def build_report(gaps: list[dict], scan_stats: dict) -> str:
     """Format the weekly gap detection report for Telegram."""
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).strftime("%A, %B %-d, %Y")
 
     severity_emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "⚪"}
-    severity_label = {"critical": "CRITICAL", "high": "HIGH", "medium": "MEDIUM", "low": "LOW"}
 
     lines = [
         f"📋 <b>Gap Detection Report — {now}</b>",
@@ -55,35 +79,30 @@ def build_report(gaps: list[dict], scan_stats: dict) -> str:
     ]
 
     if not gaps:
-        lines.append("✅ No open gaps detected across all projects.")
+        lines.append("✅ No open gaps detected.")
         return "\n".join(lines)
 
-    # Group by severity
     by_severity: dict[str, list[dict]] = {"critical": [], "high": [], "medium": [], "low": []}
     for gap in gaps:
-        sev = gap.get("severity", "low")
-        by_severity.setdefault(sev, []).append(gap)
+        by_severity.setdefault(gap.get("severity", "low"), []).append(gap)
 
     for sev in ("critical", "high", "medium", "low"):
         items = by_severity.get(sev, [])
         if not items:
             continue
 
-        emoji = severity_emoji[sev]
-        label = severity_label[sev]
-        lines.append(f"{emoji} <b>{label} ({len(items)})</b>")
-
-        # Group items by project within this severity
+        lines.append(f"{severity_emoji[sev]} <b>{sev.upper()} ({len(items)})</b>")
         by_project: dict[str, list[dict]] = {}
         for item in items:
             by_project.setdefault(item["project_name"], []).append(item)
 
-        for project, project_gaps in by_project.items():
-            for g in project_gaps:
-                desc = g["gap_description"]
-                lines.append(f"  • <b>{project}</b> — {desc}")
-
+        for project, pgaps in by_project.items():
+            for g in pgaps:
+                lines.append(f"  • <b>{project}</b> — {g['gap_description']}")
         lines.append("")
 
-    lines.append("🐝 <i>Review Monday morning. Auto-fix disabled — Jay decides priority.</i>")
+    lines.append(
+        "Commands: /status · /approve_fix &lt;id&gt; · /rollback &lt;id&gt;\n"
+        "🐝 <i>Critical gaps auto-executed. High/med/low await your approval.</i>"
+    )
     return "\n".join(lines)
