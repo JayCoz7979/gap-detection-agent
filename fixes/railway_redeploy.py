@@ -6,8 +6,15 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-RAILWAY_TOKEN = os.environ.get("RAILWAY_TOKEN", "3432c16f-a92d-4bb2-b3e1-d4c464ed0c92")
 RAILWAY_API = "https://backboard.railway.app/graphql/v2"
+_MISSING_TOKEN = "RAILWAY_TOKEN is not set; refusing to call the Railway API"
+
+
+def _railway_token() -> str | None:
+    """Return RAILWAY_TOKEN, or None when it is missing or blank."""
+    token = os.environ.get("RAILWAY_TOKEN", "").strip()
+    return token or None
+
 
 # Map project names to Railway service IDs
 SERVICE_MAP: dict[str, str] = {
@@ -25,6 +32,10 @@ def redeploy(project_name: str) -> tuple[bool, str]:
     if not service_id:
         return False, f"No Railway service ID mapped for project '{project_name}'"
 
+    token = _railway_token()
+    if token is None:
+        return False, _MISSING_TOKEN
+
     mutation = """
     mutation serviceInstanceRedeploy($serviceId: String!, $environmentId: String!) {
       serviceInstanceRedeploy(serviceId: $serviceId, environmentId: $environmentId)
@@ -36,7 +47,7 @@ def redeploy(project_name: str) -> tuple[bool, str]:
     try:
         r = httpx.post(
             RAILWAY_API,
-            headers={"Authorization": f"Bearer {RAILWAY_TOKEN}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             json={"query": mutation, "variables": {"serviceId": service_id, "environmentId": env_id}},
             timeout=15,
         )
